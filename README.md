@@ -1,0 +1,3 @@
+cat ~/.ssh/id_ed25519.pub
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHqieDK1UvsJNDKnLJVRC78ZnEdVrFHwZ4wbfksrVuCN ba7222540@gmail.com
+
