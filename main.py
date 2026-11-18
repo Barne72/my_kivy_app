@@ -12,6 +12,7 @@ from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.image import Image as CoreImage
 from kivy.graphics import Color, Line, Rectangle
+from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.filechooser import FileChooserListView
@@ -22,6 +23,7 @@ from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+BILINEAR_FILTER = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
 
 AI_PROMPT_TEMPLATE = """КОНТЕКСТ СЕРИИ (ЗАПОЛНИ ПЕРЕД ОТПРАВКОЙ):
 - Номер части: 1 (если ставишь 2, 3 и т.д. — это ПРОДОЛЖЕНИЕ, не начинай историю с нуля!).
@@ -306,24 +308,25 @@ class MangafonApp(App):
 
         request_android_storage_permissions()
 
-        root = BoxLayout(orientation="vertical", padding=6, spacing=6)
+        root = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
 
-        top_row = BoxLayout(size_hint_y=None, height=48, spacing=6)
-        btn_open = Button(text="Открыть главу", size_hint_x=0.35, background_color=(0.15, 0.4, 0.9, 1))
+        top_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        btn_open = Button(text="Открыть", size_hint_x=0.30, font_size="13sp", background_color=(0.15, 0.4, 0.9, 1))
         btn_open.bind(on_release=self.open_folder_popup)
-        btn_perms = Button(text="Права", size_hint_x=0.2)
+        btn_perms = Button(text="Права", size_hint_x=0.22, font_size="13sp")
         btn_perms.bind(on_release=lambda *_: open_all_files_permission_settings(lambda m: self.show_msg("Права", m)))
-        self.lbl_status = Label(text="Выбери папку с главой", halign="center", font_size="13sp")
+        self.lbl_status = Label(text="Выбери главу", halign="center", valign="middle", font_size="12sp")
+        self.lbl_status.bind(size=lambda w, s: setattr(w, "text_size", s))
         top_row.add_widget(btn_open)
         top_row.add_widget(btn_perms)
         top_row.add_widget(self.lbl_status)
         root.add_widget(top_row)
 
-        nav_row = BoxLayout(size_hint_y=None, height=44, spacing=6)
-        btn_prev = Button(text="< Пред.", size_hint_x=0.28)
+        nav_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        btn_prev = Button(text="< Пред.", size_hint_x=0.26, font_size="13sp")
         btn_prev.bind(on_release=lambda *_: self.change_page(-1))
-        self.lbl_page = Label(text="Стр: 0 / 0 | Кадров: 0", font_size="13sp")
-        btn_next = Button(text="След. >", size_hint_x=0.28)
+        self.lbl_page = Label(text="Стр: 0 / 0 | Кадров: 0", font_size="12sp")
+        btn_next = Button(text="След. >", size_hint_x=0.26, font_size="13sp")
         btn_next.bind(on_release=lambda *_: self.change_page(1))
         nav_row.add_widget(btn_prev)
         nav_row.add_widget(self.lbl_page)
@@ -335,24 +338,24 @@ class MangafonApp(App):
         self.scroll.add_widget(self.canvas_widget)
         root.add_widget(self.scroll)
 
-        bot1 = BoxLayout(size_hint_y=None, height=50, spacing=6)
-        self.btn_mode = Button(text="Режим: ЛИСТАТЬ", background_color=(0.3, 0.3, 0.35, 1))
+        bot1 = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
+        self.btn_mode = Button(text="Режим: ЛИСТАТЬ", font_size="13sp", background_color=(0.3, 0.3, 0.35, 1))
         self.btn_mode.bind(on_release=self.toggle_crop_mode)
 
-        btn_undo = Button(text="Удалить посл.", size_hint_x=0.35, background_color=(0.75, 0.25, 0.25, 1))
+        btn_undo = Button(text="Удалить посл.", size_hint_x=0.38, font_size="12sp", background_color=(0.75, 0.25, 0.25, 1))
         btn_undo.bind(on_release=self.undo_last_crop)
         bot1.add_widget(self.btn_mode)
         bot1.add_widget(btn_undo)
         root.add_widget(bot1)
 
-        bot2 = BoxLayout(size_hint_y=None, height=52, spacing=6)
-        btn_all_pages = Button(text="Взять все стр.", background_color=(0.15, 0.5, 0.85, 1))
+        bot2 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
+        btn_all_pages = Button(text="Все стр.", font_size="13sp", background_color=(0.15, 0.5, 0.85, 1))
         btn_all_pages.bind(on_release=self.take_all_pages)
 
-        btn_sheets = Button(text="Листы ИИ", background_color=(0.1, 0.65, 0.3, 1))
+        btn_sheets = Button(text="Листы ИИ", font_size="13sp", background_color=(0.1, 0.65, 0.3, 1))
         btn_sheets.bind(on_release=self.make_ai_sheets)
 
-        btn_prompt = Button(text="Коп. промпт", background_color=(0.55, 0.35, 0.8, 1))
+        btn_prompt = Button(text="Промпт", font_size="13sp", background_color=(0.55, 0.35, 0.8, 1))
         btn_prompt.bind(on_release=self.copy_prompt)
 
         bot2.add_widget(btn_all_pages)
@@ -363,13 +366,13 @@ class MangafonApp(App):
         return root
 
     def show_msg(self, title: str, text: str):
-        box = BoxLayout(orientation="vertical", padding=10, spacing=10)
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(10))
         sv = ScrollView()
         lbl = Label(text=text, halign="left", valign="top", size_hint_y=None, font_size="13sp")
         lbl.bind(width=lambda w, width: setattr(w, "text_size", (width, None)))
         lbl.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1]))
         sv.add_widget(lbl)
-        btn = Button(text="ОК", size_hint_y=None, height=44)
+        btn = Button(text="ОК", size_hint_y=None, height=dp(46))
         box.add_widget(sv)
         box.add_widget(btn)
         pop = Popup(title=title, content=box, size_hint=(0.92, 0.65))
@@ -378,11 +381,11 @@ class MangafonApp(App):
 
     def open_folder_popup(self, *_):
         open_all_files_permission_settings(lambda m: self.show_msg("Права", m))
-        box = BoxLayout(orientation="vertical", spacing=6, padding=6)
+        box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         chooser = FileChooserListView(path=get_default_browse_dir(), dirselect=True)
-        btns = BoxLayout(size_hint_y=None, height=48, spacing=6)
-        btn_ok = Button(text="Выбрать эту папку", background_color=(0.1, 0.65, 0.3, 1))
-        btn_cancel = Button(text="Отмена")
+        btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        btn_ok = Button(text="Выбрать папку", font_size="13sp", background_color=(0.1, 0.65, 0.3, 1))
+        btn_cancel = Button(text="Отмена", font_size="13sp")
         btns.add_widget(btn_cancel)
         btns.add_widget(btn_ok)
         box.add_widget(chooser)
@@ -459,7 +462,7 @@ class MangafonApp(App):
             max_side = 2400
             if max(orig_w, orig_h) > max_side:
                 scale = max_side / max(orig_w, orig_h)
-                disp = rgb.resize((max(1, int(orig_w * scale)), max(1, int(orig_h * scale))), Image.Resampling.BILINEAR)
+                disp = rgb.resize((max(1, int(orig_w * scale)), max(1, int(orig_h * scale))), BILINEAR_FILTER)
             else:
                 disp = rgb
 
@@ -538,7 +541,7 @@ class MangafonApp(App):
         if self.busy or not self.pages or self.output_dir is None:
             return
         self.busy = True
-        self.lbl_status.text = "Копирую страницы..."
+        self.lbl_status.text = "Копирую..."
 
         def worker():
             try:
@@ -574,10 +577,10 @@ class MangafonApp(App):
 
     def make_ai_sheets(self, *_):
         if self.busy or self.output_dir is None or not self.entries:
-            self.show_msg("Нет кадров", "Сначала вырежи кадры или нажми «Взять все стр.»")
+            self.show_msg("Нет кадров", "Сначала вырежи кадры или нажми «Все стр.»")
             return
         self.busy = True
-        self.lbl_status.text = "Делаю листы для ИИ..."
+        self.lbl_status.text = "Делаю листы..."
 
         def worker():
             try:
@@ -619,7 +622,7 @@ class MangafonApp(App):
                             iw, ih = rgb.size
                             sc = min((cell_w - 12) / iw, (cell_h - 12) / ih)
                             nw, nh = max(1, int(iw * sc)), max(1, int(ih * sc))
-                            res = rgb.resize((nw, nh), Image.Resampling.BILINEAR)
+                            res = rgb.resize((nw, nh), BILINEAR_FILTER)
                             canvas.paste(res, (x0 + (cell_w - nw) // 2, img_y0 + (cell_h - nh) // 2))
                         draw.rectangle([x0, y0, x0 + cell_w, img_y0 + cell_h], outline=(60, 70, 85), width=3)
 
@@ -629,7 +632,7 @@ class MangafonApp(App):
 
                 def done(_dt):
                     self.busy = False
-                    self.lbl_status.text = f"Листов готово: {sheet_count}"
+                    self.lbl_status.text = f"Листов: {sheet_count}"
                     self.show_msg(
                         "Готово!",
                         f"Создано листов: {sheet_count} (кадров: {len(valid)}).\nСохранено в:\n{sheets_dir}",
