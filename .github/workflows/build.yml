@@ -34,6 +34,11 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Настройка памяти Gradle
+        run: |
+          mkdir -p ~/.gradle
+          echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> ~/.gradle/gradle.properties
+
       - name: Кэширование зависимостей Buildozer
         uses: actions/cache@v4
         with:
@@ -57,6 +62,9 @@ jobs:
           pip install buildozer cython==0.29.36 setuptools==69.5.1
 
       - name: Сборка APK
+        env:
+          GRADLE_OPTS: "-Xmx4096m"
+          _JAVA_OPTIONS: "-Xmx4096m"
         run: buildozer -v android debug
 
       - name: Сохранение готового APK
