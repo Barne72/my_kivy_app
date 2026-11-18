@@ -1,10 +1,17 @@
+from array import array
+import difflib
 import io
 import json
 import re
+import ssl
 import threading
 import traceback
+import urllib.request
+import wave
+import zipfile
 from pathlib import Path
 
+import certifi
 from PIL import Image, ImageDraw, ImageFont
 from kivy.app import App
 from kivy.base import ExceptionHandler, ExceptionManager
@@ -19,11 +26,16 @@ from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".ogg", ".aac", ".flac"}
 BILINEAR_FILTER = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+
+VOSK_MODEL_NAME = "vosk-model-small-ru-0.22"
+VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
 
 AI_PROMPT_TEMPLATE = """КОНТЕКСТ СЕРИИ (ЗАПОЛНИ ПЕРЕД ОТПРАВКОЙ):
 - Номер части: 1 (если ставишь 2, 3 и т.д. — это ПРОДОЛЖЕНИЕ, не начинай историю с нуля!).
@@ -156,6 +168,25 @@ def get_default_browse_dir() -> str:
     return str(dl if dl.is_dir() else Path.home())
 
 
+def get_vosk_models_root() -> Path:
+    if platform == "android":
+        from jnius import autoclass
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        files_dir = Path(PythonActivity.mActivity.getFilesDir().getAbsolutePath())
+        return files_dir / "vosk_models"
+    return Path.home() / ".local" / "share" / "mangafon" / "vosk_models"
+
+
+def get_vosk_model_dir() -> Path:
+    return get_vosk_models_root() / VOSK_MODEL_NAME
+
+
+def is_vosk_model_ready() -> bool:
+    d = get_vosk_model_dir()
+    return (d / "am" / "final.mdl").is_file() or (d / "conf" / "model.conf").is_file()
+
+
 def request_android_storage_permissions():
     if platform != "android":
         return
@@ -195,6 +226,206 @@ def open_all_files_permission_settings(notify_error=None):
     except Exception as exc:
         if notify_error:
             notify_error(f"Не удалось открыть настройки прав:\n{exc}")
+
+
+def run_vosk_desktop(model_dir: Path, wav_path: Path, out_json_path: Path, on_progress):
+    from vosk import KaldiRecognizer, Model
+
+    on_progress(5, "Загрузка модели Vosk...")
+    model = Model(str(model_dir))
+    rec = KaldiRecognizer(model, 16000)
+    rec.SetWords(True)
+
+    words = []
+    with wave.open(str(wav_path), "rb") as wf:
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        sr = wf.getframerate()
+        total_frames = wf.getnframes()
+        duration = total_frames / float(sr) if sr > 0 else 0.0
+
+        if sw != 2:
+            raise RuntimeError(f"На ПК поддерживается только 16-bit WAV (сейчас {sw * 8}-bit)")
+
+        done_frames = 0
+        chunk_frames = 4096
+
+        while True:
+            raw = wf.readframes(chunk_frames)
+            if not raw:
+                break
+            done_frames += len(raw) // (ch * sw)
+
+            samples = array("h")
+            samples.frombytes(raw)
+            if ch == 1:
+                mono = samples
+            elif ch == 2:
+                mono = array("h", ((samples[i] + samples[i + 1]) // 2 for i in range(0, len(samples), 2)))
+            else:
+                raise RuntimeError("На ПК поддерживается только моно/стерео WAV")
+
+            if sr == 16000:
+                pcm_bytes = mono.tobytes()
+            else:
+                step = sr / 16000.0
+                out_len = max(1, int(round(len(mono) / step)))
+                res = array("h")
+                n_mono = len(mono)
+                for i in range(out_len):
+                    pos = i * step
+                    idx = int(pos)
+                    if idx >= n_mono - 1:
+                        res.append(mono[-1])
+                    else:
+                        frac = pos - idx
+                        res.append(int(mono[idx] + frac * (mono[idx + 1] - mono[idx])))
+                pcm_bytes = res.tobytes()
+
+            if rec.AcceptWaveform(pcm_bytes):
+                res_json = json.loads(rec.Result())
+                words.extend(res_json.get("result", []))
+
+            pct = min(99, int(done_frames * 100 / max(1, total_frames)))
+            on_progress(pct, f"Распознаю речь: {pct}%")
+
+    final_res = json.loads(rec.FinalResult())
+    words.extend(final_res.get("result", []))
+
+    out_json_path.write_text(
+        json.dumps({"duration": duration, "words": words}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    on_progress(100, "Готово!")
+
+
+def parse_script_frames(script_text: str) -> list[dict]:
+    frames = []
+    current = None
+    for raw_line in script_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^(2\.|3\.)\s*(ЧИСТЫЙ|ПАМЯТКА)", line, re.IGNORECASE):
+            break
+
+        m = re.match(r"^\[([^\]]+)\]\s*(.*)$", line)
+        if m:
+            if current is not None:
+                frames.append(current)
+            fname = m.group(1).strip()
+            body = m.group(2).strip()
+            current = {"filename": fname, "text": body}
+        elif current is not None:
+            current["text"] = (current["text"] + " " + line).strip()
+
+    if current is not None:
+        frames.append(current)
+    return frames
+
+
+def stem_word(word: str) -> str:
+    w = word.lower().replace("ё", "е")
+    return w[:5] if len(w) > 5 else w
+
+
+def tokenize_clean(text: str) -> list[str]:
+    no_tags = re.sub(r"<[^>]+>", " ", text)
+    raw_words = re.findall(r"[a-zа-яё0-9]+", no_tags.lower())
+    return [stem_word(w) for w in raw_words if w]
+
+
+def align_script_to_words(frames: list[dict], vosk_words: list[dict], audio_duration: float) -> list[dict]:
+    if not frames:
+        raise ValueError("В тексте не найдено строк вида [001.png] ...")
+
+    if not vosk_words:
+        total = max(audio_duration, len(frames) * 2.0)
+        step = total / len(frames)
+        return [
+            {
+                "filename": f["filename"],
+                "start": round(i * step, 2),
+                "end": round((i + 1) * step, 2),
+                "text": re.sub(r"<[^>]+>", " ", f["text"]).strip(),
+            }
+            for i, f in enumerate(frames)
+        ]
+
+    script_tokens: list[str] = []
+    frame_start_tok_idx: list[int] = []
+    for f in frames:
+        frame_start_tok_idx.append(len(script_tokens))
+        script_tokens.extend(tokenize_clean(f["text"]))
+
+    vosk_tokens = [stem_word(str(w.get("word", ""))) for w in vosk_words]
+
+    sm = difflib.SequenceMatcher(None, script_tokens, vosk_tokens, autojunk=False)
+    anchors: list[tuple[int, int]] = [(0, 0)]
+    for block in sm.get_matching_blocks():
+        for offset in range(block.size):
+            si = block.a + offset
+            vi = block.b + offset
+            if si > anchors[-1][0] and vi >= anchors[-1][1]:
+                anchors.append((si, vi))
+    anchors.append((len(script_tokens), len(vosk_words)))
+
+    def map_script_idx_to_time(s_idx: int) -> float:
+        if s_idx <= 0:
+            return 0.0
+        if s_idx >= len(script_tokens):
+            return audio_duration
+
+        lo, hi = 0, len(anchors) - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if anchors[mid][0] <= s_idx:
+                lo = mid
+            else:
+                hi = mid
+
+        s1, v1 = anchors[lo]
+        s2, v2 = anchors[hi]
+
+        if s1 == s_idx and v1 < len(vosk_words):
+            if v1 > 0:
+                prev_end = float(vosk_words[v1 - 1]["end"])
+                cur_start = float(vosk_words[v1]["start"])
+                if cur_start >= prev_end:
+                    return (prev_end + cur_start) * 0.5
+                return cur_start
+            return float(vosk_words[v1]["start"])
+
+        t1 = float(vosk_words[v1]["start"]) if v1 < len(vosk_words) else audio_duration
+        t2 = float(vosk_words[v2]["start"]) if v2 < len(vosk_words) else audio_duration
+        if s2 == s1:
+            return t1
+        frac = (s_idx - s1) / float(s2 - s1)
+        return t1 + frac * (t2 - t1)
+
+    total_dur = max(audio_duration, float(vosk_words[-1]["end"]))
+    starts = [0.0]
+    for k in range(1, len(frames)):
+        t = map_script_idx_to_time(frame_start_tok_idx[k])
+        min_t = starts[-1] + 0.35
+        max_t = max(min_t, total_dur - (len(frames) - k) * 0.35)
+        starts.append(min(max_t, max(min_t, t)))
+
+    result = []
+    for k, f in enumerate(frames):
+        s_t = round(starts[k], 2)
+        e_t = round(starts[k + 1] if k + 1 < len(frames) else total_dur, 2)
+        if e_t <= s_t:
+            e_t = round(s_t + 0.35, 2)
+        result.append(
+            {
+                "filename": f["filename"],
+                "start": s_t,
+                "end": e_t,
+                "text": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", f["text"])).strip(),
+            }
+        )
+    return result
 
 
 class MangaPageCanvas(Widget):
@@ -305,6 +536,7 @@ class MangafonApp(App):
         self.entries: list[dict] = []
         self.next_id = 1
         self.busy = False
+        self.selected_audio: Path | None = None
 
         request_android_storage_permissions()
 
@@ -349,18 +581,22 @@ class MangafonApp(App):
         root.add_widget(bot1)
 
         bot2 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
-        btn_all_pages = Button(text="Все стр.", font_size="13sp", background_color=(0.15, 0.5, 0.85, 1))
+        btn_all_pages = Button(text="Все стр.", font_size="12sp", background_color=(0.15, 0.5, 0.85, 1))
         btn_all_pages.bind(on_release=self.take_all_pages)
 
-        btn_sheets = Button(text="Листы ИИ", font_size="13sp", background_color=(0.1, 0.65, 0.3, 1))
+        btn_sheets = Button(text="Листы ИИ", font_size="12sp", background_color=(0.1, 0.65, 0.3, 1))
         btn_sheets.bind(on_release=self.make_ai_sheets)
 
-        btn_prompt = Button(text="Промпт", font_size="13sp", background_color=(0.55, 0.35, 0.8, 1))
+        btn_prompt = Button(text="Промпт", font_size="12sp", background_color=(0.55, 0.35, 0.8, 1))
         btn_prompt.bind(on_release=self.copy_prompt)
+
+        btn_timings = Button(text="Тайминги", font_size="12sp", background_color=(0.85, 0.55, 0.1, 1))
+        btn_timings.bind(on_release=self.open_timings_popup)
 
         bot2.add_widget(btn_all_pages)
         bot2.add_widget(btn_sheets)
         bot2.add_widget(btn_prompt)
+        bot2.add_widget(btn_timings)
         root.add_widget(bot2)
 
         return root
@@ -420,6 +656,7 @@ class MangafonApp(App):
             self.chapter_dir = folder
             self.pages = pages
             self.output_dir = output_dir
+            self.selected_audio = self.find_audio_in_output_dir()
 
             self.entries = []
             self.next_id = 1
@@ -443,6 +680,15 @@ class MangafonApp(App):
             )
         except Exception:
             self.show_msg("Ошибка открытия главы", traceback.format_exc())
+
+    def find_audio_in_output_dir(self) -> Path | None:
+        if self.output_dir is None or not self.output_dir.is_dir():
+            return None
+        files = sorted(
+            [p for p in self.output_dir.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS],
+            key=lambda p: (0 if p.suffix.lower() == ".wav" else 1, p.name.lower()),
+        )
+        return files[0] if files else None
 
     def save_data(self):
         if self.output_dir is None:
@@ -653,6 +899,331 @@ class MangafonApp(App):
     def copy_prompt(self, *_):
         Clipboard.copy(AI_PROMPT_TEMPLATE)
         self.lbl_status.text = "Промпт скопирован!"
+
+    # ---------- ЭТАП 2.1: ТАЙМИНГИ ЧЕРЕЗ VOSK ----------
+    def open_timings_popup(self, *_):
+        if self.output_dir is None:
+            self.show_msg("Сначала открой главу", "Нажми «Открыть» и выбери папку с главой, чтобы знать, где лежит папка _cut.")
+            return
+
+        if self.selected_audio is None or not self.selected_audio.is_file():
+            self.selected_audio = self.find_audio_in_output_dir()
+
+        box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+
+        # 1. Статус и скачивание модели Vosk
+        model_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        lbl_model = Label(font_size="12sp", halign="left", valign="middle")
+        lbl_model.bind(size=lambda w, s: setattr(w, "text_size", s))
+        btn_dl_model = Button(text="Скачать (45 МБ)", size_hint_x=0.52, font_size="12sp", background_color=(0.15, 0.5, 0.85, 1))
+        model_row.add_widget(lbl_model)
+        model_row.add_widget(btn_dl_model)
+        box.add_widget(model_row)
+
+        def refresh_model_ui():
+            if is_vosk_model_ready():
+                lbl_model.text = "Модель Vosk: готова ✓"
+                btn_dl_model.text = "Перекачать"
+                btn_dl_model.background_color = (0.35, 0.35, 0.4, 1)
+            else:
+                lbl_model.text = "Модель Vosk: не скачана"
+                btn_dl_model.text = "Скачать (45 МБ)"
+                btn_dl_model.background_color = (0.15, 0.5, 0.85, 1)
+
+        refresh_model_ui()
+
+        # 2. Выбор аудиофайла
+        audio_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        lbl_audio = Label(font_size="12sp", halign="left", valign="middle")
+        lbl_audio.bind(size=lambda w, s: setattr(w, "text_size", s))
+        btn_pick_audio = Button(text="Выбрать .wav", size_hint_x=0.36, font_size="12sp")
+        audio_row.add_widget(lbl_audio)
+        audio_row.add_widget(btn_pick_audio)
+        box.add_widget(audio_row)
+
+        def refresh_audio_ui():
+            if self.selected_audio and self.selected_audio.is_file():
+                lbl_audio.text = f"Аудио: {self.selected_audio.name}"
+            else:
+                lbl_audio.text = "Аудио: не найдено в _cut"
+
+        refresh_audio_ui()
+
+        # 3. Сценарий для монтажа
+        script_btns = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+        lbl_sc = Label(text="Сценарий:", font_size="12sp", halign="left", valign="middle")
+        lbl_sc.bind(size=lambda w, s: setattr(w, "text_size", s))
+        btn_paste = Button(text="Вставить", size_hint_x=0.26, font_size="12sp", background_color=(0.45, 0.3, 0.75, 1))
+        btn_pick_txt = Button(text="Из .txt", size_hint_x=0.24, font_size="12sp", background_color=(0.15, 0.5, 0.85, 1))
+        btn_clear = Button(text="Очистить", size_hint_x=0.24, font_size="12sp")
+        script_btns.add_widget(lbl_sc)
+        script_btns.add_widget(btn_paste)
+        script_btns.add_widget(btn_pick_txt)
+        script_btns.add_widget(btn_clear)
+        box.add_widget(script_btns)
+
+        def read_text_smart(fp: Path) -> str:
+            for enc in ("utf-8-sig", "utf-8", "cp1251"):
+                try:
+                    return fp.read_text(encoding=enc)
+                except UnicodeDecodeError:
+                    continue
+            return fp.read_text(encoding="utf-8", errors="replace")
+
+        script_file = self.output_dir / "script.txt"
+        initial_script = ""
+        if script_file.is_file():
+            initial_script = read_text_smart(script_file)
+        else:
+            txts = sorted(
+                [p for p in self.output_dir.iterdir() if p.is_file() and p.suffix.lower() == ".txt" and p.name not in {"timings.txt", "PROMPT.txt"}],
+                key=lambda p: p.name.lower(),
+            )
+            if txts:
+                initial_script = read_text_smart(txts[0])
+
+        txt_script = TextInput(
+            text=initial_script,
+            hint_text="Нажми «Из .txt» или «Вставить» со строками [001.png] ...",
+            multiline=True,
+            size_hint_y=0.38,
+            font_size="12sp",
+        )
+        box.add_widget(txt_script)
+
+        btn_paste.bind(on_release=lambda *_: setattr(txt_script, "text", Clipboard.paste() or ""))
+        btn_clear.bind(on_release=lambda *_: setattr(txt_script, "text", ""))
+
+        # 4. Запуск расчёта и прогресс
+        lbl_t_status = Label(text="Готово к расчёту", size_hint_y=None, height=dp(26), font_size="12sp")
+        box.add_widget(lbl_t_status)
+
+        btn_run = Button(
+            text="Рассчитать тайминги (Vosk)",
+            size_hint_y=None,
+            height=dp(48),
+            font_size="13sp",
+            background_color=(0.1, 0.65, 0.3, 1),
+        )
+        box.add_widget(btn_run)
+
+        # 5. Результат таймингов
+        res_sv = ScrollView(size_hint_y=0.32)
+        lbl_res = Label(text="", halign="left", valign="top", size_hint_y=None, font_size="12sp")
+        lbl_res.bind(width=lambda w, width: setattr(w, "text_size", (width, None)))
+        lbl_res.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1]))
+        res_sv.add_widget(lbl_res)
+        box.add_widget(res_sv)
+
+        def show_timings_preview(items: list[dict]):
+            lines = [f"[{it['filename']}] {it['start']:.2f}с -> {it['end']:.2f}с ({it['end'] - it['start']:.2f}с) | {it['text'][:45]}" for it in items]
+            lbl_res.text = "\n".join(lines)
+
+        timings_file = self.output_dir / "timings.json"
+        if timings_file.is_file():
+            try:
+                old_items = json.loads(timings_file.read_text(encoding="utf-8"))
+                show_timings_preview(old_items)
+            except Exception:
+                pass
+
+        btn_close = Button(text="Закрыть", size_hint_y=None, height=dp(44), font_size="13sp")
+        box.add_widget(btn_close)
+
+        pop = Popup(title=f"Тайминги: {self.output_dir.name}", content=box, size_hint=(0.96, 0.94))
+        btn_close.bind(on_release=pop.dismiss)
+
+        def pick_audio(*_):
+            abox = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+            start_dir = str(self.output_dir if self.output_dir.is_dir() else get_default_browse_dir())
+            fc = FileChooserListView(path=start_dir, filters=["*.wav", "*.mp3", "*.m4a", "*.ogg", "*.WAV", "*.MP3"])
+            abtn_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+            abtn_ok = Button(text="Выбрать", font_size="13sp", background_color=(0.1, 0.65, 0.3, 1))
+            abtn_cancel = Button(text="Отмена", font_size="13sp")
+            abtn_row.add_widget(abtn_cancel)
+            abtn_row.add_widget(abtn_ok)
+            abox.add_widget(fc)
+            abox.add_widget(abtn_row)
+            apop = Popup(title="Выбери файл озвучки", content=abox, size_hint=(0.94, 0.82))
+            abtn_cancel.bind(on_release=apop.dismiss)
+
+            def on_ok(*_):
+                if fc.selection:
+                    self.selected_audio = Path(fc.selection[0])
+                    refresh_audio_ui()
+                apop.dismiss()
+
+            abtn_ok.bind(on_release=on_ok)
+            apop.open()
+
+        btn_pick_audio.bind(on_release=pick_audio)
+
+        def pick_txt(*_):
+            tbox = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+            start_dir = str(self.output_dir if self.output_dir.is_dir() else get_default_browse_dir())
+            fc = FileChooserListView(path=start_dir, filters=["*.txt", "*.TXT"])
+            tbtn_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+            tbtn_ok = Button(text="Выбрать", font_size="13sp", background_color=(0.1, 0.65, 0.3, 1))
+            tbtn_cancel = Button(text="Отмена", font_size="13sp")
+            tbtn_row.add_widget(tbtn_cancel)
+            tbtn_row.add_widget(tbtn_ok)
+            tbox.add_widget(fc)
+            tbox.add_widget(tbtn_row)
+            tpop = Popup(title="Выбери .txt файл со сценарием", content=tbox, size_hint=(0.94, 0.82))
+            tbtn_cancel.bind(on_release=tpop.dismiss)
+
+            def on_ok(*_):
+                if fc.selection:
+                    sel = Path(fc.selection[0])
+                    if sel.is_file():
+                        txt_script.text = read_text_smart(sel)
+                        lbl_t_status.text = f"Загружен: {sel.name}"
+                tpop.dismiss()
+
+            tbtn_ok.bind(on_release=on_ok)
+            tpop.open()
+
+        btn_pick_txt.bind(on_release=pick_txt)
+
+        def download_model(*_):
+            if self.busy:
+                return
+            self.busy = True
+            lbl_t_status.text = "Начинаю скачивание модели..."
+
+            def worker():
+                try:
+                    root_dir = get_vosk_models_root()
+                    root_dir.mkdir(parents=True, exist_ok=True)
+                    zip_path = root_dir / f"{VOSK_MODEL_NAME}.zip"
+
+                    ctx = ssl.create_default_context(cafile=certifi.where())
+                    req = urllib.request.Request(VOSK_MODEL_URL, headers={"User-Agent": "MangafonApp/1.0"})
+                    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp, open(zip_path, "wb") as out:
+                        total = int(resp.headers.get("Content-Length") or 0)
+                        done = 0
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            done += len(chunk)
+                            if total > 0:
+                                pct = int(done * 100 / total)
+                                Clock.schedule_once(lambda _dt, p=pct: setattr(lbl_t_status, "text", f"Скачивание модели: {p}%"))
+                            else:
+                                mb = done / (1024 * 1024)
+                                Clock.schedule_once(lambda _dt, m=mb: setattr(lbl_t_status, "text", f"Скачано: {m:.1f} МБ"))
+
+                    Clock.schedule_once(lambda _dt: setattr(lbl_t_status, "text", "Распаковка модели..."))
+                    with zipfile.ZipFile(zip_path, "r") as zf:
+                        zf.extractall(root_dir)
+                    if zip_path.is_file():
+                        zip_path.unlink()
+
+                    def on_done(_dt):
+                        self.busy = False
+                        refresh_model_ui()
+                        lbl_t_status.text = "Модель Vosk скачана и готова!"
+
+                    Clock.schedule_once(on_done)
+                except Exception:
+                    err = traceback.format_exc()
+
+                    def on_err(_dt):
+                        self.busy = False
+                        lbl_t_status.text = "Ошибка скачивания"
+                        self.show_msg("Ошибка скачивания модели", err)
+
+                    Clock.schedule_once(on_err)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_dl_model.bind(on_release=download_model)
+
+        def run_alignment(*_):
+            if self.busy:
+                return
+            if not is_vosk_model_ready():
+                self.show_msg("Нет модели", "Сначала нажми «Скачать (45 МБ)» и дождись загрузки модели Vosk.")
+                return
+            if not self.selected_audio or not self.selected_audio.is_file():
+                self.show_msg("Нет аудио", "Положи файл .wav в папку _cut или выбери его кнопкой «Выбрать .wav».")
+                return
+
+            frames = parse_script_frames(txt_script.text)
+            if not frames:
+                self.show_msg("Пустой сценарий", "Вставь текст или выбери .txt со строками вида:\n[001.png] Всем привет! ...")
+                return
+
+            script_file.write_text(txt_script.text, encoding="utf-8")
+            self.busy = True
+            lbl_t_status.text = "Запуск Vosk..."
+
+            audio_path = self.selected_audio
+            model_dir = get_vosk_model_dir()
+            words_json = self.output_dir / "vosk_words.json"
+
+            poll_ev = None
+            if platform == "android":
+                from jnius import autoclass
+
+                VoskHelper = autoclass("org.mangafon.VoskHelper")
+                VoskHelper.progressPercent = 0
+                VoskHelper.progressText = "Запуск Vosk..."
+                poll_ev = Clock.schedule_interval(lambda _dt: setattr(lbl_t_status, "text", str(VoskHelper.progressText)), 0.25)
+
+            def worker():
+                try:
+                    if platform == "android":
+                        from jnius import autoclass
+
+                        VH = autoclass("org.mangafon.VoskHelper")
+                        VH.recognizeAudio(str(model_dir), str(audio_path), str(words_json))
+                    else:
+                        run_vosk_desktop(
+                            model_dir,
+                            audio_path,
+                            words_json,
+                            lambda _p, msg: Clock.schedule_once(lambda _dt, m=msg: setattr(lbl_t_status, "text", m)),
+                        )
+
+                    data = json.loads(words_json.read_text(encoding="utf-8"))
+                    vosk_words = data.get("words", [])
+                    dur = float(data.get("duration", 0.0))
+                    aligned = align_script_to_words(frames, vosk_words, dur)
+
+                    (self.output_dir / "timings.json").write_text(
+                        json.dumps(aligned, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    txt_lines = [f"[{it['filename']}] {it['start']:.2f} - {it['end']:.2f} ({it['end'] - it['start']:.2f}с) | {it['text']}" for it in aligned]
+                    (self.output_dir / "timings.txt").write_text("\n".join(txt_lines), encoding="utf-8")
+
+                    def on_done(_dt):
+                        if poll_ev is not None:
+                            poll_ev.cancel()
+                        self.busy = False
+                        lbl_t_status.text = f"Готово! Кадров: {len(aligned)}, длит.: {dur:.1f}с"
+                        show_timings_preview(aligned)
+
+                    Clock.schedule_once(on_done)
+                except Exception:
+                    err = traceback.format_exc()
+
+                    def on_err(_dt):
+                        if poll_ev is not None:
+                            poll_ev.cancel()
+                        self.busy = False
+                        lbl_t_status.text = "Ошибка Vosk"
+                        self.show_msg("Ошибка Vosk", err)
+
+                    Clock.schedule_once(on_err)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_run.bind(on_release=run_alignment)
+        pop.open()
 
 
 if __name__ == "__main__":
