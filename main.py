@@ -2,10 +2,12 @@ import io
 import json
 import re
 import threading
+import traceback
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 from kivy.app import App
+from kivy.base import ExceptionHandler, ExceptionManager
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.image import Image as CoreImage
@@ -64,8 +66,53 @@ AI_PROMPT_TEMPLATE = """КОНТЕКСТ СЕРИИ (ЗАПОЛНИ ПЕРЕД �
 """
 
 
+class UiExceptionHandler(ExceptionHandler):
+    def handle_exception(self, inst):
+        tb = traceback.format_exc()
+        app = App.get_running_app()
+        if app is not None:
+            Clock.schedule_once(lambda *_: app.show_msg("Ошибка в приложении", tb))
+            return ExceptionManager.PASS
+        return ExceptionManager.RAISE
+
+
+ExceptionManager.add_handler(UiExceptionHandler())
+
+
 def natural_sort_key(path: Path):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
+
+
+def open_image_rgb(path: Path) -> Image.Image:
+    try:
+        with Image.open(path) as im:
+            return im.convert("RGB")
+    except Exception as pil_err:
+        if platform == "android":
+            from jnius import autoclass
+
+            BitmapFactory = autoclass("android.graphics.BitmapFactory")
+            Bitmap_CompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
+            FileOutputStream = autoclass("java.io.FileOutputStream")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            bitmap = BitmapFactory.decodeFile(str(path))
+            if bitmap is None:
+                raise RuntimeError(f"Не удалось открыть картинку {path.name}:\n{pil_err}")
+
+            cache_dir = Path(PythonActivity.mActivity.getCacheDir().getAbsolutePath())
+            tmp_png = cache_dir / "_tmp_decode.png"
+            fos = FileOutputStream(str(tmp_png))
+            try:
+                bitmap.compress(Bitmap_CompressFormat.PNG, 100, fos)
+                fos.flush()
+            finally:
+                fos.close()
+                bitmap.recycle()
+
+            with Image.open(tmp_png) as im2:
+                return im2.convert("RGB")
+        raise
 
 
 def load_bold_font(size: int = 40):
@@ -91,6 +138,7 @@ def get_default_browse_dir() -> str:
     if platform == "android":
         try:
             from android.storage import primary_external_storage_path
+
             root = Path(primary_external_storage_path())
             dl = root / "Download"
             if (dl / "manga").is_dir():
@@ -111,6 +159,7 @@ def request_android_storage_permissions():
         return
     try:
         from android.permissions import Permission, request_permissions
+
         perms = [Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE]
         if hasattr(Permission, "READ_MEDIA_IMAGES"):
             perms.append(Permission.READ_MEDIA_IMAGES)
@@ -119,11 +168,12 @@ def request_android_storage_permissions():
         pass
 
 
-def open_all_files_permission_settings():
+def open_all_files_permission_settings(notify_error=None):
     if platform != "android":
         return
     try:
         from jnius import autoclass
+
         Build_VERSION = autoclass("android.os.Build$VERSION")
         if Build_VERSION.SDK_INT >= 30:
             Environment = autoclass("android.os.Environment")
@@ -132,12 +182,17 @@ def open_all_files_permission_settings():
                 Settings = autoclass("android.provider.Settings")
                 Uri = autoclass("android.net.Uri")
                 PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                uri = Uri.parse("package:" + PythonActivity.mActivity.getPackageName())
-                intent.setData(uri)
-                PythonActivity.mActivity.startActivity(intent)
-    except Exception:
-        pass
+                try:
+                    intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                    uri = Uri.parse("package:" + PythonActivity.mActivity.getPackageName())
+                    intent.setData(uri)
+                    PythonActivity.mActivity.startActivity(intent)
+                except Exception:
+                    intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    PythonActivity.mActivity.startActivity(intent)
+    except Exception as exc:
+        if notify_error:
+            notify_error(f"Не удалось открыть настройки прав:\n{exc}")
 
 
 class MangaPageCanvas(Widget):
@@ -148,7 +203,7 @@ class MangaPageCanvas(Widget):
         self.texture = None
         self.orig_w = 0
         self.orig_h = 0
-        self.overlays: list[list[int]] = []  # список [x1, y1, x2, y2] в координатах оригинала
+        self.overlays: list[list[int]] = []
         self._drag_start = None
         self._drag_end = None
         self.bind(pos=self.redraw, size=self.redraw)
@@ -176,7 +231,6 @@ class MangaPageCanvas(Widget):
                 Rectangle(texture=self.texture, pos=self.pos, size=self.size)
 
             if self.orig_w > 0 and self.orig_h > 0:
-                # Зелёные рамки уже вырезанных фрагментов
                 for bbox in self.overlays:
                     px1, py1, px2, py2 = bbox
                     kx = self.x + (px1 / self.orig_w) * self.width
@@ -188,7 +242,6 @@ class MangaPageCanvas(Widget):
                     Color(0.13, 0.77, 0.37, 0.95)
                     Line(rectangle=(kx, ky, kw, kh), width=2)
 
-            # Текущая красная рамка выделения пальцем
             if self._drag_start and self._drag_end:
                 x1, y1 = self._drag_start
                 x2, y2 = self._drag_end
@@ -255,19 +308,17 @@ class MangafonApp(App):
 
         root = BoxLayout(orientation="vertical", padding=6, spacing=6)
 
-        # Верхняя строка: папка и статус
         top_row = BoxLayout(size_hint_y=None, height=48, spacing=6)
         btn_open = Button(text="Открыть главу", size_hint_x=0.35, background_color=(0.15, 0.4, 0.9, 1))
         btn_open.bind(on_release=self.open_folder_popup)
         btn_perms = Button(text="Права", size_hint_x=0.2)
-        btn_perms.bind(on_release=lambda *_: open_all_files_permission_settings())
+        btn_perms.bind(on_release=lambda *_: open_all_files_permission_settings(lambda m: self.show_msg("Права", m)))
         self.lbl_status = Label(text="Выбери папку с главой", halign="center", font_size="13sp")
         top_row.add_widget(btn_open)
         top_row.add_widget(btn_perms)
         top_row.add_widget(self.lbl_status)
         root.add_widget(top_row)
 
-        # Листалка страниц
         nav_row = BoxLayout(size_hint_y=None, height=44, spacing=6)
         btn_prev = Button(text="< Пред.", size_hint_x=0.28)
         btn_prev.bind(on_release=lambda *_: self.change_page(-1))
@@ -279,13 +330,11 @@ class MangafonApp(App):
         nav_row.add_widget(btn_next)
         root.add_widget(nav_row)
 
-        # Основной экран со страницей
         self.scroll = ScrollView(do_scroll_x=False, do_scroll_y=True)
         self.canvas_widget = MangaPageCanvas(self.on_crop_region, size_hint=(1, None))
         self.scroll.add_widget(self.canvas_widget)
         root.add_widget(self.scroll)
 
-        # Нижняя панель действий под палец
         bot1 = BoxLayout(size_hint_y=None, height=50, spacing=6)
         self.btn_mode = Button(text="Режим: ЛИСТАТЬ", background_color=(0.3, 0.3, 0.35, 1))
         self.btn_mode.bind(on_release=self.toggle_crop_mode)
@@ -315,17 +364,20 @@ class MangafonApp(App):
 
     def show_msg(self, title: str, text: str):
         box = BoxLayout(orientation="vertical", padding=10, spacing=10)
-        lbl = Label(text=text, halign="center", valign="middle")
-        lbl.bind(size=lambda w, s: setattr(w, "text_size", (s[0], None)))
+        sv = ScrollView()
+        lbl = Label(text=text, halign="left", valign="top", size_hint_y=None, font_size="13sp")
+        lbl.bind(width=lambda w, width: setattr(w, "text_size", (width, None)))
+        lbl.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1]))
+        sv.add_widget(lbl)
         btn = Button(text="ОК", size_hint_y=None, height=44)
-        box.add_widget(lbl)
+        box.add_widget(sv)
         box.add_widget(btn)
-        pop = Popup(title=title, content=box, size_hint=(0.88, 0.45))
+        pop = Popup(title=title, content=box, size_hint=(0.92, 0.65))
         btn.bind(on_release=pop.dismiss)
         pop.open()
 
     def open_folder_popup(self, *_):
-        open_all_files_permission_settings()
+        open_all_files_permission_settings(lambda m: self.show_msg("Права", m))
         box = BoxLayout(orientation="vertical", spacing=6, padding=6)
         chooser = FileChooserListView(path=get_default_browse_dir(), dirselect=True)
         btns = BoxLayout(size_hint_y=None, height=48, spacing=6)
@@ -348,35 +400,46 @@ class MangafonApp(App):
         pop.open()
 
     def load_chapter(self, folder: Path):
-        if folder.is_file():
-            folder = folder.parent
-        pages = sorted(
-            [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
-            key=natural_sort_key,
-        )
-        if not pages:
-            self.show_msg("Пусто", f"В папке нет картинок:\n{folder}")
-            return
+        try:
+            if folder.is_file():
+                folder = folder.parent
+            pages = sorted(
+                [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
+                key=natural_sort_key,
+            )
+            if not pages:
+                self.show_msg("Пусто", f"В папке нет картинок:\n{folder}")
+                return
 
-        self.chapter_dir = folder
-        self.pages = pages
-        self.output_dir = folder.parent / f"{folder.name}_cut"
-        (self.output_dir / "frames").mkdir(parents=True, exist_ok=True)
+            output_dir = folder.parent / f"{folder.name}_cut"
+            (output_dir / "frames").mkdir(parents=True, exist_ok=True)
 
-        self.entries = []
-        self.next_id = 1
-        data_file = self.output_dir / "data.json"
-        if data_file.is_file():
-            try:
-                self.entries = json.loads(data_file.read_text(encoding="utf-8"))
-                if self.entries:
-                    self.next_id = max(e["id"] for e in self.entries) + 1
-            except Exception:
-                self.entries = []
+            self.chapter_dir = folder
+            self.pages = pages
+            self.output_dir = output_dir
 
-        self.page_idx = 0
-        self.display_current_page()
-        self.lbl_status.text = f"Папка: {folder.name}"
+            self.entries = []
+            self.next_id = 1
+            data_file = self.output_dir / "data.json"
+            if data_file.is_file():
+                try:
+                    self.entries = json.loads(data_file.read_text(encoding="utf-8"))
+                    if self.entries:
+                        self.next_id = max(e["id"] for e in self.entries) + 1
+                except Exception:
+                    self.entries = []
+
+            self.page_idx = 0
+            self.display_current_page()
+            self.lbl_status.text = f"Папка: {folder.name}"
+        except PermissionError:
+            self.show_msg(
+                "Нет доступа к папке",
+                f"Android не разрешил читать/создавать файлы в:\n{folder}\n\n"
+                "Нажми кнопку «Права» вверху, включи «Доступ ко всем файлам» для Mangafon Cutter и попробуй снова.",
+            )
+        except Exception:
+            self.show_msg("Ошибка открытия главы", traceback.format_exc())
 
     def save_data(self):
         if self.output_dir is None:
@@ -389,12 +452,11 @@ class MangafonApp(App):
     def display_current_page(self):
         if not self.pages or self.page_idx < 0:
             return
-        p = self.pages[self.page_idx]
-        with Image.open(p) as im:
-            rgb = im.convert("RGB")
+        try:
+            p = self.pages[self.page_idx]
+            rgb = open_image_rgb(p)
             orig_w, orig_h = rgb.size
-            # Защита от лимита OpenGL текстур на Android (обычно 4096px)
-            max_side = 2800
+            max_side = 2400
             if max(orig_w, orig_h) > max_side:
                 scale = max_side / max(orig_w, orig_h)
                 disp = rgb.resize((max(1, int(orig_w * scale)), max(1, int(orig_h * scale))), Image.Resampling.BILINEAR)
@@ -406,10 +468,12 @@ class MangafonApp(App):
             buf.seek(0)
             tex = CoreImage(buf, ext="jpg").texture
 
-        overlays = [e["bbox"] for e in self.entries if e["source_page"] == p.name]
-        self.canvas_widget.set_page(tex, orig_w, orig_h, overlays)
-        self.scroll.scroll_y = 1.0
-        self.update_page_label()
+            overlays = [e["bbox"] for e in self.entries if e["source_page"] == p.name]
+            self.canvas_widget.set_page(tex, orig_w, orig_h, overlays)
+            self.scroll.scroll_y = 1.0
+            self.update_page_label()
+        except Exception:
+            self.show_msg("Ошибка показа страницы", traceback.format_exc())
 
     def update_page_label(self):
         self.lbl_page.text = f"Стр: {self.page_idx + 1} / {len(self.pages)} | Кадров: {len(self.entries)}"
@@ -436,22 +500,24 @@ class MangafonApp(App):
     def on_crop_region(self, x1: int, y1: int, x2: int, y2: int):
         if self.output_dir is None or self.page_idx < 0:
             return
-        p = self.pages[self.page_idx]
-        eid = self.next_id
-        self.next_id += 1
-        fname = f"{eid:03d}.png"
-        fpath = self.output_dir / "frames" / fname
+        try:
+            p = self.pages[self.page_idx]
+            eid = self.next_id
+            self.next_id += 1
+            fname = f"{eid:03d}.png"
+            fpath = self.output_dir / "frames" / fname
 
-        with Image.open(p) as im:
-            im.convert("RGB").crop((x1, y1, x2, y2)).save(fpath, format="PNG")
+            open_image_rgb(p).crop((x1, y1, x2, y2)).save(fpath, format="PNG")
 
-        self.entries.append({"id": eid, "filename": fname, "source_page": p.name, "bbox": [x1, y1, x2, y2]})
-        self.save_data()
-        overlays = [e["bbox"] for e in self.entries if e["source_page"] == p.name]
-        self.canvas_widget.overlays = overlays
-        self.canvas_widget.redraw()
-        self.update_page_label()
-        self.lbl_status.text = f"Вырезан #{eid:03d}"
+            self.entries.append({"id": eid, "filename": fname, "source_page": p.name, "bbox": [x1, y1, x2, y2]})
+            self.save_data()
+            overlays = [e["bbox"] for e in self.entries if e["source_page"] == p.name]
+            self.canvas_widget.overlays = overlays
+            self.canvas_widget.redraw()
+            self.update_page_label()
+            self.lbl_status.text = f"Вырезан #{eid:03d}"
+        except Exception:
+            self.show_msg("Ошибка вырезки", traceback.format_exc())
 
     def undo_last_crop(self, *_):
         if not self.entries or self.output_dir is None:
@@ -485,10 +551,9 @@ class MangafonApp(App):
                 for idx, p in enumerate(self.pages, 1):
                     fname = f"{idx:03d}.png"
                     fpath = self.output_dir / "frames" / fname
-                    with Image.open(p) as im:
-                        rgb = im.convert("RGB")
-                        pw, ph = rgb.size
-                        rgb.save(fpath, format="PNG")
+                    rgb = open_image_rgb(p)
+                    pw, ph = rgb.size
+                    rgb.save(fpath, format="PNG")
                     new_entries.append({"id": idx, "filename": fname, "source_page": p.name, "bbox": [0, 0, pw, ph]})
                     Clock.schedule_once(lambda dt, i=idx, t=total: setattr(self.lbl_status, "text", f"Копирую: {i}/{t}"))
 
@@ -501,8 +566,9 @@ class MangafonApp(App):
                     self.lbl_status.text = f"Готово: {len(new_entries)} стр."
 
                 Clock.schedule_once(done)
-            except Exception as exc:
-                Clock.schedule_once(lambda dt: self._on_worker_err(str(exc)))
+            except Exception:
+                err_txt = traceback.format_exc()
+                Clock.schedule_once(lambda dt: self._on_worker_err(err_txt))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -570,8 +636,9 @@ class MangafonApp(App):
                     )
 
                 Clock.schedule_once(done)
-            except Exception as exc:
-                Clock.schedule_once(lambda dt: self._on_worker_err(str(exc)))
+            except Exception:
+                err_txt = traceback.format_exc()
+                Clock.schedule_once(lambda dt: self._on_worker_err(err_txt))
 
         threading.Thread(target=worker, daemon=True).start()
 
