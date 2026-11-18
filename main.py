@@ -3,7 +3,9 @@ import difflib
 import io
 import json
 import re
+import shutil
 import ssl
+import subprocess
 import threading
 import traceback
 import urllib.request
@@ -228,6 +230,16 @@ def open_all_files_permission_settings(notify_error=None):
             notify_error(f"Не удалось открыть настройки прав:\n{exc}")
 
 
+def find_audio_in_dir(folder: Path | None) -> Path | None:
+    if folder is None or not folder.is_dir():
+        return None
+    files = sorted(
+        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS],
+        key=lambda p: (0 if p.suffix.lower() == ".wav" else 1, p.name.lower()),
+    )
+    return files[0] if files else None
+
+
 def run_vosk_desktop(model_dir: Path, wav_path: Path, out_json_path: Path, on_progress):
     from vosk import KaldiRecognizer, Model
 
@@ -297,6 +309,56 @@ def run_vosk_desktop(model_dir: Path, wav_path: Path, out_json_path: Path, on_pr
         encoding="utf-8",
     )
     on_progress(100, "Готово!")
+
+
+def run_video_desktop(frames_dir: Path, timings: list[dict], audio_path: Path, out_mp4: Path, width: int, height: int):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("Для сборки видео на Linux Mint установи ffmpeg:\nsudo apt install -y ffmpeg")
+
+    prep_dir = out_mp4.parent / "_tmp_prep_frames"
+    prep_dir.mkdir(parents=True, exist_ok=True)
+    concat_file = out_mp4.parent / "_tmp_concat.txt"
+
+    try:
+        lines = []
+        for idx, it in enumerate(timings):
+            src = frames_dir / it["filename"]
+            dst = prep_dir / f"f_{idx:04d}.jpg"
+            with Image.open(src) as im:
+                rgb = im.convert("RGB")
+                sw, sh = rgb.size
+                bg = rgb.resize((96, 54), BILINEAR_FILTER).resize((width, height), BILINEAR_FILTER)
+                dark = Image.new("RGB", (width, height), (10, 12, 18))
+                canvas = Image.blend(bg, dark, 0.72)
+
+                sc = min((width - 72) / sw, (height - 48) / sh)
+                nw, nh = max(1, int(sw * sc)), max(1, int(sh * sc))
+                fg = rgb.resize((nw, nh), BILINEAR_FILTER)
+                canvas.paste(fg, ((width - nw) // 2, (height - nh) // 2))
+                canvas.save(dst, format="JPEG", quality=92)
+
+            dur = max(0.2, float(it["end"]) - float(it["start"]))
+            lines.append(f"file '{dst.as_posix()}'")
+            lines.append(f"duration {dur:.3f}")
+        lines.append(f"file '{(prep_dir / f'f_{len(timings) - 1:04d}.jpg').as_posix()}'")
+        concat_file.write_text("\n".join(lines), encoding="utf-8")
+
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-i", str(audio_path),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
+            str(out_mp4),
+        ]
+        subprocess.run(cmd, check=True)
+    finally:
+        if concat_file.is_file():
+            concat_file.unlink()
+        if prep_dir.is_dir():
+            shutil.rmtree(prep_dir, ignore_errors=True)
 
 
 def parse_script_frames(script_text: str) -> list[dict]:
@@ -538,6 +600,12 @@ class MangafonApp(App):
         self.busy = False
         self.selected_audio: Path | None = None
 
+        self.v_frames_dir: Path | None = None
+        self.v_timings_file: Path | None = None
+        self.v_audio_file: Path | None = None
+        self.v_out_dir: Path | None = None
+        self.v_out_name: str = "video.mp4"
+
         request_android_storage_permissions()
 
         root = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
@@ -580,23 +648,27 @@ class MangafonApp(App):
         bot1.add_widget(btn_undo)
         root.add_widget(bot1)
 
-        bot2 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
-        btn_all_pages = Button(text="Все стр.", font_size="12sp", background_color=(0.15, 0.5, 0.85, 1))
+        bot2 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(4))
+        btn_all_pages = Button(text="Все стр.", font_size="11sp", background_color=(0.15, 0.5, 0.85, 1))
         btn_all_pages.bind(on_release=self.take_all_pages)
 
-        btn_sheets = Button(text="Листы ИИ", font_size="12sp", background_color=(0.1, 0.65, 0.3, 1))
+        btn_sheets = Button(text="Листы", font_size="11sp", background_color=(0.1, 0.65, 0.3, 1))
         btn_sheets.bind(on_release=self.make_ai_sheets)
 
-        btn_prompt = Button(text="Промпт", font_size="12sp", background_color=(0.55, 0.35, 0.8, 1))
+        btn_prompt = Button(text="Промпт", font_size="11sp", background_color=(0.55, 0.35, 0.8, 1))
         btn_prompt.bind(on_release=self.copy_prompt)
 
-        btn_timings = Button(text="Тайминги", font_size="12sp", background_color=(0.85, 0.55, 0.1, 1))
+        btn_timings = Button(text="Тайм.", font_size="11sp", background_color=(0.85, 0.55, 0.1, 1))
         btn_timings.bind(on_release=self.open_timings_popup)
+
+        btn_video = Button(text="Видео", font_size="11sp", background_color=(0.85, 0.2, 0.45, 1))
+        btn_video.bind(on_release=self.open_video_popup)
 
         bot2.add_widget(btn_all_pages)
         bot2.add_widget(btn_sheets)
         bot2.add_widget(btn_prompt)
         bot2.add_widget(btn_timings)
+        bot2.add_widget(btn_video)
         root.add_widget(bot2)
 
         return root
@@ -656,7 +728,13 @@ class MangafonApp(App):
             self.chapter_dir = folder
             self.pages = pages
             self.output_dir = output_dir
-            self.selected_audio = self.find_audio_in_output_dir()
+            self.selected_audio = find_audio_in_dir(output_dir)
+
+            self.v_frames_dir = output_dir / "frames"
+            self.v_timings_file = (output_dir / "timings.json") if (output_dir / "timings.json").is_file() else None
+            self.v_audio_file = self.selected_audio
+            self.v_out_dir = output_dir
+            self.v_out_name = f"{folder.name}.mp4"
 
             self.entries = []
             self.next_id = 1
@@ -680,15 +758,6 @@ class MangafonApp(App):
             )
         except Exception:
             self.show_msg("Ошибка открытия главы", traceback.format_exc())
-
-    def find_audio_in_output_dir(self) -> Path | None:
-        if self.output_dir is None or not self.output_dir.is_dir():
-            return None
-        files = sorted(
-            [p for p in self.output_dir.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS],
-            key=lambda p: (0 if p.suffix.lower() == ".wav" else 1, p.name.lower()),
-        )
-        return files[0] if files else None
 
     def save_data(self):
         if self.output_dir is None:
@@ -907,11 +976,10 @@ class MangafonApp(App):
             return
 
         if self.selected_audio is None or not self.selected_audio.is_file():
-            self.selected_audio = self.find_audio_in_output_dir()
+            self.selected_audio = find_audio_in_dir(self.output_dir)
 
         box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
 
-        # 1. Статус и скачивание модели Vosk
         model_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
         lbl_model = Label(font_size="12sp", halign="left", valign="middle")
         lbl_model.bind(size=lambda w, s: setattr(w, "text_size", s))
@@ -932,7 +1000,6 @@ class MangafonApp(App):
 
         refresh_model_ui()
 
-        # 2. Выбор аудиофайла
         audio_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
         lbl_audio = Label(font_size="12sp", halign="left", valign="middle")
         lbl_audio.bind(size=lambda w, s: setattr(w, "text_size", s))
@@ -949,7 +1016,6 @@ class MangafonApp(App):
 
         refresh_audio_ui()
 
-        # 3. Сценарий для монтажа
         script_btns = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
         lbl_sc = Label(text="Сценарий:", font_size="12sp", halign="left", valign="middle")
         lbl_sc.bind(size=lambda w, s: setattr(w, "text_size", s))
@@ -994,7 +1060,6 @@ class MangafonApp(App):
         btn_paste.bind(on_release=lambda *_: setattr(txt_script, "text", Clipboard.paste() or ""))
         btn_clear.bind(on_release=lambda *_: setattr(txt_script, "text", ""))
 
-        # 4. Запуск расчёта и прогресс
         lbl_t_status = Label(text="Готово к расчёту", size_hint_y=None, height=dp(26), font_size="12sp")
         box.add_widget(lbl_t_status)
 
@@ -1007,7 +1072,6 @@ class MangafonApp(App):
         )
         box.add_widget(btn_run)
 
-        # 5. Результат таймингов
         res_sv = ScrollView(size_hint_y=0.32)
         lbl_res = Label(text="", halign="left", valign="top", size_hint_y=None, font_size="12sp")
         lbl_res.bind(width=lambda w, width: setattr(w, "text_size", (width, None)))
@@ -1050,6 +1114,7 @@ class MangafonApp(App):
             def on_ok(*_):
                 if fc.selection:
                     self.selected_audio = Path(fc.selection[0])
+                    self.v_audio_file = self.selected_audio
                     refresh_audio_ui()
                 apop.dismiss()
 
@@ -1193,10 +1258,12 @@ class MangafonApp(App):
                     dur = float(data.get("duration", 0.0))
                     aligned = align_script_to_words(frames, vosk_words, dur)
 
-                    (self.output_dir / "timings.json").write_text(
+                    t_json = self.output_dir / "timings.json"
+                    t_json.write_text(
                         json.dumps(aligned, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
+                    self.v_timings_file = t_json
                     txt_lines = [f"[{it['filename']}] {it['start']:.2f} - {it['end']:.2f} ({it['end'] - it['start']:.2f}с) | {it['text']}" for it in aligned]
                     (self.output_dir / "timings.txt").write_text("\n".join(txt_lines), encoding="utf-8")
 
@@ -1223,6 +1290,337 @@ class MangafonApp(App):
             threading.Thread(target=worker, daemon=True).start()
 
         btn_run.bind(on_release=run_alignment)
+        pop.open()
+
+    # ---------- ЭТАП 2.2: СБОРКА ВИДЕО MP4 (16:9) С РУЧНЫМ ВЫБОРОМ ----------
+    def open_video_popup(self, *_):
+        open_all_files_permission_settings(lambda m: self.show_msg("Права", m))
+
+        if self.output_dir is not None:
+            if self.v_frames_dir is None and (self.output_dir / "frames").is_dir():
+                self.v_frames_dir = self.output_dir / "frames"
+            if self.v_timings_file is None and (self.output_dir / "timings.json").is_file():
+                self.v_timings_file = self.output_dir / "timings.json"
+            if self.v_audio_file is None:
+                self.v_audio_file = find_audio_in_dir(self.output_dir)
+            if self.v_out_dir is None:
+                self.v_out_dir = self.output_dir
+            if self.chapter_dir is not None and self.v_out_name == "video.mp4":
+                self.v_out_name = f"{self.chapter_dir.name}.mp4"
+
+        box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+
+        btn_auto_cut = Button(
+            text="Выбрать папку _cut (авто-подбор)",
+            size_hint_y=None,
+            height=dp(42),
+            font_size="12sp",
+            background_color=(0.25, 0.45, 0.85, 1),
+        )
+        box.add_widget(btn_auto_cut)
+
+        def make_picker_row(btn_text: str):
+            row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
+            lbl = Label(font_size="11sp", halign="left", valign="middle")
+            lbl.bind(size=lambda w, s: setattr(w, "text_size", s))
+            btn = Button(text=btn_text, size_hint_x=0.34, font_size="11sp")
+            row.add_widget(lbl)
+            row.add_widget(btn)
+            box.add_widget(row)
+            return lbl, btn
+
+        lbl_frames, btn_frames = make_picker_row("Папка frames")
+        lbl_timings, btn_timings = make_picker_row("Файл timings")
+        lbl_audio, btn_audio = make_picker_row("Озвучка")
+        lbl_outdir, btn_outdir = make_picker_row("Папка MP4")
+
+        name_row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
+        lbl_nm = Label(text="Имя MP4:", size_hint_x=0.28, font_size="12sp", halign="left", valign="middle")
+        lbl_nm.bind(size=lambda w, s: setattr(w, "text_size", s))
+        txt_mp4_name = TextInput(text=self.v_out_name, multiline=False, font_size="12sp")
+        name_row.add_widget(lbl_nm)
+        name_row.add_widget(txt_mp4_name)
+        box.add_widget(name_row)
+
+        state = {"hd1080": True, "zoom": True}
+
+        opt_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        btn_res = Button(text="1920x1080 (Full HD)", font_size="12sp", background_color=(0.15, 0.45, 0.85, 1))
+        btn_zoom = Button(text="Плавный зум: ВКЛ", font_size="12sp", background_color=(0.2, 0.6, 0.35, 1))
+        opt_row.add_widget(btn_res)
+        opt_row.add_widget(btn_zoom)
+        box.add_widget(opt_row)
+
+        lbl_v_info = Label(text="", size_hint_y=None, height=dp(36), font_size="11sp", halign="center", valign="middle")
+        lbl_v_info.bind(size=lambda w, s: setattr(w, "text_size", s))
+        box.add_widget(lbl_v_info)
+
+        lbl_v_status = Label(text="Выбери файлы и нажми «Собрать MP4»", size_hint_y=None, height=dp(28), font_size="12sp")
+        box.add_widget(lbl_v_status)
+
+        act_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        btn_render = Button(text="Собрать MP4", font_size="13sp", background_color=(0.1, 0.65, 0.3, 1))
+        btn_cancel = Button(text="Отмена / Закрыть", size_hint_x=0.45, font_size="12sp")
+        act_row.add_widget(btn_render)
+        act_row.add_widget(btn_cancel)
+        box.add_widget(act_row)
+
+        def short_path(p: Path | None) -> str:
+            if p is None:
+                return "не выбрано"
+            return f".../{p.parent.name}/{p.name}" if p.parent.name else str(p)
+
+        def refresh_video_ui():
+            lbl_frames.text = f"Кадры: {short_path(self.v_frames_dir)}"
+            lbl_timings.text = f"Тайм.: {short_path(self.v_timings_file)}"
+            lbl_audio.text = f"Аудио: {short_path(self.v_audio_file)}"
+            lbl_outdir.text = f"Куда: {short_path(self.v_out_dir)}"
+
+            info_parts = []
+            if self.v_frames_dir and self.v_frames_dir.is_dir():
+                cnt = sum(1 for f in self.v_frames_dir.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
+                info_parts.append(f"Картинок в frames: {cnt}")
+            if self.v_timings_file and self.v_timings_file.is_file():
+                try:
+                    t_data = json.loads(self.v_timings_file.read_text(encoding="utf-8"))
+                    dur = float(t_data[-1]["end"]) if t_data else 0.0
+                    info_parts.append(f"В timings: {len(t_data)} кадр., {dur:.1f}с")
+                except Exception:
+                    info_parts.append("timings.json повреждён")
+            lbl_v_info.text = " | ".join(info_parts) if info_parts else "Файлы ещё не выбраны"
+
+        refresh_video_ui()
+
+        def auto_fill_from_cut_dir(cut_dir: Path):
+            if cut_dir.is_file():
+                cut_dir = cut_dir.parent
+            if (cut_dir / "frames").is_dir():
+                self.v_frames_dir = cut_dir / "frames"
+            if (cut_dir / "timings.json").is_file():
+                self.v_timings_file = cut_dir / "timings.json"
+            aud = find_audio_in_dir(cut_dir)
+            if aud is not None:
+                self.v_audio_file = aud
+            self.v_out_dir = cut_dir
+            base_name = cut_dir.name[:-4] if cut_dir.name.endswith("_cut") else cut_dir.name
+            if base_name:
+                txt_mp4_name.text = f"{base_name}.mp4"
+                self.v_out_name = txt_mp4_name.text
+            refresh_video_ui()
+
+        def open_picker(title: str, start_dir: Path | None, dir_mode: bool, filters: list[str] | None, on_pick):
+            pbox = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+            init_path = str(start_dir if (start_dir and start_dir.is_dir()) else get_default_browse_dir())
+            fc_kwargs = {"path": init_path, "dirselect": dir_mode}
+            if filters and not dir_mode:
+                fc_kwargs["filters"] = filters
+            fc = FileChooserListView(**fc_kwargs)
+            pbtns = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+            p_ok = Button(text="Выбрать", font_size="13sp", background_color=(0.1, 0.65, 0.3, 1))
+            p_cancel = Button(text="Отмена", font_size="13sp")
+            pbtns.add_widget(p_cancel)
+            pbtns.add_widget(p_ok)
+            pbox.add_widget(fc)
+            pbox.add_widget(pbtns)
+
+            ppop = Popup(title=title, content=pbox, size_hint=(0.95, 0.85))
+            p_cancel.bind(on_release=ppop.dismiss)
+
+            def on_ok(*_):
+                if dir_mode:
+                    chosen = Path(fc.selection[0] if fc.selection else fc.path)
+                    if chosen.is_file():
+                        chosen = chosen.parent
+                    ppop.dismiss()
+                    on_pick(chosen)
+                else:
+                    if fc.selection:
+                        chosen = Path(fc.selection[0])
+                        if chosen.is_file():
+                            ppop.dismiss()
+                            on_pick(chosen)
+
+            p_ok.bind(on_release=on_ok)
+            ppop.open()
+
+        def on_pick_cut(*_):
+            base = self.v_out_dir.parent if (self.v_out_dir and self.v_out_dir.parent.is_dir()) else None
+            open_picker("Выбери папку _cut", base, True, None, auto_fill_from_cut_dir)
+
+        def on_pick_frames(*_):
+            def picked(p: Path):
+                self.v_frames_dir = p
+                parent = p.parent
+                if self.v_timings_file is None and (parent / "timings.json").is_file():
+                    self.v_timings_file = parent / "timings.json"
+                if self.v_audio_file is None:
+                    self.v_audio_file = find_audio_in_dir(parent)
+                if self.v_out_dir is None:
+                    self.v_out_dir = parent
+                refresh_video_ui()
+
+            open_picker("Выбери папку с кадрами (frames)", self.v_frames_dir or self.v_out_dir, True, None, picked)
+
+        def on_pick_timings(*_):
+            def picked(p: Path):
+                self.v_timings_file = p
+                parent = p.parent
+                if self.v_frames_dir is None and (parent / "frames").is_dir():
+                    self.v_frames_dir = parent / "frames"
+                if self.v_audio_file is None:
+                    self.v_audio_file = find_audio_in_dir(parent)
+                if self.v_out_dir is None:
+                    self.v_out_dir = parent
+                refresh_video_ui()
+
+            start = self.v_timings_file.parent if self.v_timings_file else self.v_out_dir
+            open_picker("Выбери файл timings.json", start, False, ["*.json", "*.JSON"], picked)
+
+        def on_pick_audio(*_):
+            def picked(p: Path):
+                self.v_audio_file = p
+                if self.v_out_dir is None:
+                    self.v_out_dir = p.parent
+                refresh_video_ui()
+
+            start = self.v_audio_file.parent if self.v_audio_file else self.v_out_dir
+            open_picker("Выбери файл озвучки", start, False, ["*.wav", "*.mp3", "*.m4a", "*.ogg", "*.WAV", "*.MP3"], picked)
+
+        def on_pick_outdir(*_):
+            def picked(p: Path):
+                self.v_out_dir = p
+                refresh_video_ui()
+
+            open_picker("Куда сохранить MP4", self.v_out_dir, True, None, picked)
+
+        btn_auto_cut.bind(on_release=on_pick_cut)
+        btn_frames.bind(on_release=on_pick_frames)
+        btn_timings.bind(on_release=on_pick_timings)
+        btn_audio.bind(on_release=on_pick_audio)
+        btn_outdir.bind(on_release=on_pick_outdir)
+
+        def toggle_res(*_):
+            state["hd1080"] = not state["hd1080"]
+            btn_res.text = "1920x1080 (Full HD)" if state["hd1080"] else "1280x720 (Быстро)"
+
+        def toggle_zoom(*_):
+            state["zoom"] = not state["zoom"]
+            btn_zoom.text = "Плавный зум: ВКЛ" if state["zoom"] else "Плавный зум: ВЫКЛ"
+            btn_zoom.background_color = (0.2, 0.6, 0.35, 1) if state["zoom"] else (0.35, 0.35, 0.4, 1)
+
+        btn_res.bind(on_release=toggle_res)
+        btn_zoom.bind(on_release=toggle_zoom)
+
+        pop = Popup(title="Сборка видео MP4 (16:9)", content=box, size_hint=(0.96, 0.92), auto_dismiss=False)
+
+        def on_cancel(*_):
+            if self.busy and platform == "android":
+                try:
+                    from jnius import autoclass
+
+                    autoclass("org.mangafon.VideoMakerHelper").requestCancel()
+                    lbl_v_status.text = "Отменяю..."
+                except Exception:
+                    pass
+            else:
+                pop.dismiss()
+
+        btn_cancel.bind(on_release=on_cancel)
+
+        def start_render(*_):
+            if self.busy:
+                return
+            if not self.v_frames_dir or not self.v_frames_dir.is_dir():
+                self.show_msg("Не выбрано", "Выбери папку с кадрами (frames).")
+                return
+            if not self.v_timings_file or not self.v_timings_file.is_file():
+                self.show_msg("Не выбрано", "Выбери файл timings.json.")
+                return
+            if not self.v_audio_file or not self.v_audio_file.is_file():
+                self.show_msg("Не выбрано", "Выбери файл озвучки (.wav / .mp3).")
+                return
+
+            try:
+                timings = json.loads(self.v_timings_file.read_text(encoding="utf-8"))
+                if not timings:
+                    raise ValueError("Файл timings.json пустой")
+            except Exception:
+                self.show_msg("Ошибка timings.json", traceback.format_exc())
+                return
+
+            out_dir = self.v_out_dir or self.v_timings_file.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            name = txt_mp4_name.text.strip() or "video.mp4"
+            if not name.lower().endswith(".mp4"):
+                name += ".mp4"
+            self.v_out_name = name
+            out_mp4 = out_dir / name
+
+            self.busy = True
+            btn_render.disabled = True
+            w = 1920 if state["hd1080"] else 1280
+            h = 1080 if state["hd1080"] else 720
+            ken_burns = state["zoom"]
+            frames_dir = self.v_frames_dir
+            timings_file = self.v_timings_file
+            audio_path = self.v_audio_file
+
+            poll_ev = None
+            if platform == "android":
+                from jnius import autoclass
+
+                VM = autoclass("org.mangafon.VideoMakerHelper")
+                VM.progressPercent = 0
+                VM.progressText = "Запуск рендера..."
+                poll_ev = Clock.schedule_interval(lambda _dt: setattr(lbl_v_status, "text", str(VM.progressText)), 0.25)
+            else:
+                lbl_v_status.text = "Рендер через ffmpeg..."
+
+            def worker():
+                try:
+                    if platform == "android":
+                        from jnius import autoclass
+
+                        VM = autoclass("org.mangafon.VideoMakerHelper")
+                        VM.createVideo(
+                            str(frames_dir),
+                            str(timings_file),
+                            str(audio_path),
+                            str(out_mp4),
+                            w,
+                            h,
+                            30,
+                            ken_burns,
+                        )
+                    else:
+                        run_video_desktop(frames_dir, timings, audio_path, out_mp4, w, h)
+
+                    def on_done(_dt):
+                        if poll_ev is not None:
+                            poll_ev.cancel()
+                        self.busy = False
+                        btn_render.disabled = False
+                        lbl_v_status.text = f"Готово: {out_mp4.name}"
+                        pop.dismiss()
+                        self.show_msg("Видео готово!", f"MP4 успешно сохранён:\n{out_mp4}")
+
+                    Clock.schedule_once(on_done)
+                except Exception:
+                    err = traceback.format_exc()
+
+                    def on_err(_dt):
+                        if poll_ev is not None:
+                            poll_ev.cancel()
+                        self.busy = False
+                        btn_render.disabled = False
+                        lbl_v_status.text = "Ошибка сборки видео"
+                        self.show_msg("Ошибка создания MP4", err)
+
+                    Clock.schedule_once(on_err)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_render.bind(on_release=start_render)
         pop.open()
 
 
