@@ -95,6 +95,43 @@ class UiExceptionHandler(ExceptionHandler):
 ExceptionManager.add_handler(UiExceptionHandler())
 
 
+def notify_progress(title: str, text: str, percent: int):
+    if platform == "android":
+        try:
+            from jnius import autoclass
+
+            autoclass("org.mangafon.NotifyHelper").showProgress(title, text, int(percent))
+        except Exception:
+            pass
+
+
+def notify_cancel_progress():
+    if platform == "android":
+        try:
+            from jnius import autoclass
+
+            autoclass("org.mangafon.NotifyHelper").cancelProgress()
+        except Exception:
+            pass
+
+
+def notify_done(title: str, text: str):
+    if platform == "android":
+        try:
+            from jnius import autoclass
+
+            autoclass("org.mangafon.NotifyHelper").showDone(title, text)
+        except Exception:
+            pass
+    else:
+        ns = shutil.which("notify-send")
+        if ns:
+            try:
+                subprocess.Popen([ns, title, text])
+            except Exception:
+                pass
+
+
 def natural_sort_key(path: Path):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
 
@@ -189,15 +226,19 @@ def is_vosk_model_ready() -> bool:
     return (d / "am" / "final.mdl").is_file() or (d / "conf" / "model.conf").is_file()
 
 
-def request_android_storage_permissions():
+def request_android_permissions():
     if platform != "android":
         return
     try:
         from android.permissions import Permission, request_permissions
+        from jnius import autoclass
 
         perms = [Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE]
         if hasattr(Permission, "READ_MEDIA_IMAGES"):
             perms.append(Permission.READ_MEDIA_IMAGES)
+        Build_VERSION = autoclass("android.os.Build$VERSION")
+        if Build_VERSION.SDK_INT >= 33:
+            perms.append(getattr(Permission, "POST_NOTIFICATIONS", "android.permission.POST_NOTIFICATIONS"))
         request_permissions(perms)
     except Exception:
         pass
@@ -606,7 +647,7 @@ class MangafonApp(App):
         self.v_out_dir: Path | None = None
         self.v_out_name: str = "video.mp4"
 
-        request_android_storage_permissions()
+        request_android_permissions()
 
         root = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
 
@@ -882,6 +923,7 @@ class MangafonApp(App):
                     self.display_current_page()
                     self.busy = False
                     self.lbl_status.text = f"Готово: {len(new_entries)} стр."
+                    notify_done("Страницы скопированы", f"Готово: {len(new_entries)} стр.")
 
                 Clock.schedule_once(done)
             except Exception:
@@ -948,6 +990,7 @@ class MangafonApp(App):
                 def done(_dt):
                     self.busy = False
                     self.lbl_status.text = f"Листов: {sheet_count}"
+                    notify_done("Листы ИИ готовы!", f"Создано листов: {sheet_count} (кадров: {len(valid)})")
                     self.show_msg(
                         "Готово!",
                         f"Создано листов: {sheet_count} (кадров: {len(valid)}).\nСохранено в:\n{sheets_dir}",
@@ -963,6 +1006,7 @@ class MangafonApp(App):
     def _on_worker_err(self, msg: str):
         self.busy = False
         self.lbl_status.text = "Ошибка"
+        notify_done("Ошибка в приложении", "Открой приложение для деталей")
         self.show_msg("Ошибка", msg)
 
     def copy_prompt(self, *_):
@@ -1155,6 +1199,7 @@ class MangafonApp(App):
                 return
             self.busy = True
             lbl_t_status.text = "Начинаю скачивание модели..."
+            notify_progress("Скачивание модели Vosk", "Подключение...", 0)
 
             def worker():
                 try:
@@ -1164,6 +1209,7 @@ class MangafonApp(App):
 
                     ctx = ssl.create_default_context(cafile=certifi.where())
                     req = urllib.request.Request(VOSK_MODEL_URL, headers={"User-Agent": "MangafonApp/1.0"})
+                    last_pct = -5
                     with urllib.request.urlopen(req, context=ctx, timeout=60) as resp, open(zip_path, "wb") as out:
                         total = int(resp.headers.get("Content-Length") or 0)
                         done = 0
@@ -1176,11 +1222,15 @@ class MangafonApp(App):
                             if total > 0:
                                 pct = int(done * 100 / total)
                                 Clock.schedule_once(lambda _dt, p=pct: setattr(lbl_t_status, "text", f"Скачивание модели: {p}%"))
+                                if pct - last_pct >= 5:
+                                    last_pct = pct
+                                    notify_progress("Скачивание модели Vosk", f"{pct}%", pct)
                             else:
                                 mb = done / (1024 * 1024)
                                 Clock.schedule_once(lambda _dt, m=mb: setattr(lbl_t_status, "text", f"Скачано: {m:.1f} МБ"))
 
                     Clock.schedule_once(lambda _dt: setattr(lbl_t_status, "text", "Распаковка модели..."))
+                    notify_progress("Скачивание модели Vosk", "Распаковка...", 99)
                     with zipfile.ZipFile(zip_path, "r") as zf:
                         zf.extractall(root_dir)
                     if zip_path.is_file():
@@ -1190,6 +1240,7 @@ class MangafonApp(App):
                         self.busy = False
                         refresh_model_ui()
                         lbl_t_status.text = "Модель Vosk скачана и готова!"
+                        notify_done("Модель Vosk готова!", "Можно рассчитывать тайминги")
 
                     Clock.schedule_once(on_done)
                 except Exception:
@@ -1198,6 +1249,7 @@ class MangafonApp(App):
                     def on_err(_dt):
                         self.busy = False
                         lbl_t_status.text = "Ошибка скачивания"
+                        notify_done("Ошибка скачивания Vosk", "Открой приложение для деталей")
                         self.show_msg("Ошибка скачивания модели", err)
 
                     Clock.schedule_once(on_err)
@@ -1224,6 +1276,7 @@ class MangafonApp(App):
             script_file.write_text(txt_script.text, encoding="utf-8")
             self.busy = True
             lbl_t_status.text = "Запуск Vosk..."
+            notify_progress("Vosk: расчёт таймингов", "Запуск...", 0)
 
             audio_path = self.selected_audio
             model_dir = get_vosk_model_dir()
@@ -1236,7 +1289,17 @@ class MangafonApp(App):
                 VoskHelper = autoclass("org.mangafon.VoskHelper")
                 VoskHelper.progressPercent = 0
                 VoskHelper.progressText = "Запуск Vosk..."
-                poll_ev = Clock.schedule_interval(lambda _dt: setattr(lbl_t_status, "text", str(VoskHelper.progressText)), 0.25)
+                last_npct = [-5]
+
+                def poll_vosk(_dt):
+                    txt = str(VoskHelper.progressText)
+                    pct = int(VoskHelper.progressPercent)
+                    lbl_t_status.text = txt
+                    if abs(pct - last_npct[0]) >= 3 or pct in (0, 100):
+                        last_npct[0] = pct
+                        notify_progress("Vosk: распознавание речи", txt, pct)
+
+                poll_ev = Clock.schedule_interval(poll_vosk, 0.3)
 
             def worker():
                 try:
@@ -1273,6 +1336,7 @@ class MangafonApp(App):
                         self.busy = False
                         lbl_t_status.text = f"Готово! Кадров: {len(aligned)}, длит.: {dur:.1f}с"
                         show_timings_preview(aligned)
+                        notify_done("Тайминги Vosk готовы!", f"Кадров: {len(aligned)}, длит.: {dur:.1f} сек")
 
                     Clock.schedule_once(on_done)
                 except Exception:
@@ -1283,6 +1347,7 @@ class MangafonApp(App):
                             poll_ev.cancel()
                         self.busy = False
                         lbl_t_status.text = "Ошибка Vosk"
+                        notify_done("Ошибка Vosk", "Открой приложение для деталей")
                         self.show_msg("Ошибка Vosk", err)
 
                     Clock.schedule_once(on_err)
@@ -1572,7 +1637,18 @@ class MangafonApp(App):
                 VM = autoclass("org.mangafon.VideoMakerHelper")
                 VM.progressPercent = 0
                 VM.progressText = "Запуск рендера..."
-                poll_ev = Clock.schedule_interval(lambda _dt: setattr(lbl_v_status, "text", str(VM.progressText)), 0.25)
+                last_vpct = [-5]
+                notify_progress("Сборка MP4", f"{out_mp4.name}: запуск...", 0)
+
+                def poll_video(_dt):
+                    txt = str(VM.progressText)
+                    pct = int(VM.progressPercent)
+                    lbl_v_status.text = txt
+                    if abs(pct - last_vpct[0]) >= 3 or pct in (0, 100):
+                        last_vpct[0] = pct
+                        notify_progress(f"Сборка {out_mp4.name}", txt, pct)
+
+                poll_ev = Clock.schedule_interval(poll_video, 0.3)
             else:
                 lbl_v_status.text = "Рендер через ffmpeg..."
 
@@ -1601,6 +1677,7 @@ class MangafonApp(App):
                         self.busy = False
                         btn_render.disabled = False
                         lbl_v_status.text = f"Готово: {out_mp4.name}"
+                        notify_done("Видео MP4 готово!", f"Файл сохранён:\n{out_mp4.name}")
                         pop.dismiss()
                         self.show_msg("Видео готово!", f"MP4 успешно сохранён:\n{out_mp4}")
 
@@ -1614,6 +1691,9 @@ class MangafonApp(App):
                         self.busy = False
                         btn_render.disabled = False
                         lbl_v_status.text = "Ошибка сборки видео"
+                        notify_cancel_progress()
+                        if "отменена" not in err.lower():
+                            notify_done("Ошибка сборки MP4", "Открой приложение для деталей")
                         self.show_msg("Ошибка создания MP4", err)
 
                     Clock.schedule_once(on_err)
