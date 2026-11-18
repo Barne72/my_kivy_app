@@ -22,7 +22,17 @@ jobs:
         uses: actions/setup-java@v5
         with:
           java-version: '17'
-          distribution: 'temurin'
+          distribution: 'zulu'
+
+      - name: Подготовка ключа подписи Android
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -noprompt -v -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
 
       - name: Кэширование зависимостей Buildozer
         uses: actions/cache@v4
