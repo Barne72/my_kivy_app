@@ -34,20 +34,23 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Настройка памяти Gradle
-        run: |
-          mkdir -p ~/.gradle
-          echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> ~/.gradle/gradle.properties
-
-      - name: Кэширование зависимостей Buildozer
+      - name: Кэширование зависимостей Buildozer и Gradle
         uses: actions/cache@v4
         with:
           path: |
             .buildozer
             ~/.buildozer
+            ~/.gradle/caches
+            ~/.gradle/wrapper
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
             buildozer-${{ runner.os }}-
+
+      - name: Настройка памяти и зеркала Gradle
+        run: |
+          mkdir -p ~/.gradle/init.d
+          echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> ~/.gradle/gradle.properties
+          printf 'allprojects {\n  buildscript { repositories { maven { url "https://maven-central.storage-download.googleapis.com/maven2/" } } }\n  repositories { maven { url "https://maven-central.storage-download.googleapis.com/maven2/" } }\n}\n' > ~/.gradle/init.d/mirror.gradle
 
       - name: Установка системных пакетов
         run: |
